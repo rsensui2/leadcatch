@@ -1,0 +1,16 @@
+{
+  "name": "LeadCatch — 展示会リード管理",
+  "short_name": "LeadCatch",
+  "description": "展示会で獲得したリードをその場で登録・確度管理するツール",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#EA5514",
+  "icons": [
+    {"src":"icon-192.png","sizes":"192x192","type":"image/png"},
+    {"src":"icon-512.png","sizes":"512x512","type":"image/png"},
+    {"src":"icon-maskable-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}
+  ]
+}
