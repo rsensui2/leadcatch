@@ -202,6 +202,44 @@
 
   input[type=file]{display:none}
 
+  /* ===== 名刺スキャン ===== */
+  .scan-box{margin-bottom:20px}
+  .scan-btn{
+    width:100%;display:flex;flex-direction:column;align-items:center;gap:3px;
+    background:linear-gradient(135deg,var(--brand),#ff7a3d);color:#fff;border:none;cursor:pointer;
+    font-family:inherit;padding:20px 16px;border-radius:16px;
+    box-shadow:0 6px 20px rgba(234,85,20,.34);transition:.12s;
+  }
+  .scan-btn:hover{filter:brightness(1.04)}
+  .scan-btn:active{transform:translateY(1px)}
+  .scan-btn:disabled{opacity:.6;cursor:default;filter:grayscale(.2)}
+  .scan-btn .scan-ico{font-size:32px;line-height:1}
+  .scan-btn .scan-txt{font-size:18px;font-weight:800;letter-spacing:.5px}
+  .scan-btn .scan-sub{font-size:12px;font-weight:600;opacity:.92}
+  .scan-prog{display:none;align-items:center;gap:12px;margin-top:13px;
+    background:var(--brand-soft);border:1px solid #ffd9c4;border-radius:12px;padding:13px 15px}
+  .scan-prog.show{display:flex}
+  .scan-prog-txt{font-size:14px;font-weight:700;color:var(--brand-dark)}
+  .spinner{width:22px;height:22px;flex:0 0 22px;border-radius:50%;
+    border:3px solid #ffd9c4;border-top-color:var(--brand);animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .scan-preview{margin-top:13px}
+  .scan-preview img{max-width:100%;max-height:200px;border-radius:12px;border:1px solid var(--line);display:block}
+  .scan-note{font-size:12px;color:var(--ink-soft);margin-top:8px;line-height:1.5}
+  /* 自動入力された欄のハイライト */
+  input.autofilled,textarea.autofilled{
+    background:#fff7f2;border-color:var(--brand);
+    box-shadow:0 0 0 3px rgba(234,85,20,.12);
+  }
+  /* 一覧サムネ */
+  .lead-thumb{flex:0 0 auto;margin-right:12px}
+  .lead-thumb img{width:48px;height:48px;object-fit:cover;border-radius:9px;border:1px solid var(--line);cursor:pointer;display:block}
+  .lead-top.has-thumb{align-items:center}
+  .img-modal{position:fixed;inset:0;z-index:120;background:rgba(15,18,28,.82);
+    display:none;align-items:center;justify-content:center;padding:20px}
+  .img-modal.show{display:flex}
+  .img-modal img{max-width:96vw;max-height:90vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+
   /* ===== Responsive: tablet / mobile ===== */
   @media (max-width:980px){
     .kpis{grid-template-columns:repeat(2,1fr)}
@@ -296,6 +334,21 @@
         <div class="pill" id="addCount">本日 0 件</div>
       </div>
       <div class="card">
+        <!-- ===== 名刺スキャン (OCR) ===== -->
+        <div class="scan-box">
+          <button type="button" class="scan-btn" id="btnScan">
+            <span class="scan-ico">📷</span>
+            <span class="scan-txt">名刺をスキャン</span>
+            <span class="scan-sub">カメラ撮影 / 画像選択 → 自動入力</span>
+          </button>
+          <input type="file" id="fileCard" accept="image/*" capture="environment">
+          <div class="scan-prog" id="scanProg">
+            <div class="spinner"></div>
+            <div class="scan-prog-txt" id="scanProgTxt">読み取り中… 0%</div>
+          </div>
+          <div class="scan-preview" id="scanPreview"></div>
+        </div>
+
         <form id="leadForm" autocomplete="off">
           <div class="form-grid">
             <div class="field"><label>氏名<span class="req">*</span></label><input id="f_name" placeholder="山田 太郎" required></div>
@@ -446,7 +499,9 @@
 <button class="fab" id="fab" title="クイック追加">＋</button>
 
 <div class="toast" id="toast"><span id="toastMsg"></span></div>
+<div class="img-modal" id="imgModal"><img id="imgModalImg" alt=""></div>
 
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <script>
 "use strict";
 const KEY="leadcatch_data_v2";
@@ -526,18 +581,247 @@ document.getElementById("leadForm").addEventListener("submit",e=>{
     grade:document.querySelector('input[name="grade"]:checked').value,
     status:"todo",
     date:dateInput.value||TODAY,
-    memo:val("f_memo")
+    memo:val("f_memo"),
+    photoId:pendingPhotoId||null
   };
   data.unshift(lead);save();
   const f=e.target;f.reset();
   dateInput.value=TODAY;
   // reset grade to A
   document.querySelector('input[name="grade"][value="A"]').checked=true;
+  clearScanState();
   document.getElementById("f_name").focus();
   toast("✅ "+(lead.name||"リード")+" を登録（連続入力OK）");
   render();
 });
 function val(id){return document.getElementById(id).value.trim();}
+document.getElementById("leadForm").addEventListener("reset",()=>{clearScanState();});
+
+/* ================= 名刺スキャン (IndexedDB + Tesseract OCR) ================= */
+let pendingPhotoId=null;       // 保存待ちの画像ID（フォーム submit時にleadへ紐付け）
+let ocrWorker=null;            // 使い回すTesseract worker
+
+/* ----- IndexedDB: 名刺画像ストア ----- */
+const IMGDB_NAME="leadcatch_img", IMGDB_STORE="cards";
+let _imgDbPromise=null;
+function imgDB(){
+  if(_imgDbPromise)return _imgDbPromise;
+  _imgDbPromise=new Promise((res,rej)=>{
+    if(!("indexedDB" in window)){rej(new Error("no-idb"));return;}
+    const req=indexedDB.open(IMGDB_NAME,1);
+    req.onupgradeneeded=()=>{const db=req.result;if(!db.objectStoreNames.contains(IMGDB_STORE))db.createObjectStore(IMGDB_STORE,{keyPath:"id",autoIncrement:true});};
+    req.onsuccess=()=>res(req.result);
+    req.onerror=()=>rej(req.error);
+  });
+  return _imgDbPromise;
+}
+async function imgPut(blob){
+  const db=await imgDB();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction(IMGDB_STORE,"readwrite");
+    const rq=tx.objectStore(IMGDB_STORE).add({blob,created:Date.now()});
+    rq.onsuccess=()=>res(rq.result);rq.onerror=()=>rej(rq.error);
+  });
+}
+async function imgGet(id){
+  if(id==null)return null;
+  const db=await imgDB();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction(IMGDB_STORE,"readonly");
+    const rq=tx.objectStore(IMGDB_STORE).get(id);
+    rq.onsuccess=()=>res(rq.result?rq.result.blob:null);rq.onerror=()=>rej(rq.error);
+  });
+}
+async function imgDel(id){
+  if(id==null)return;
+  try{const db=await imgDB();const tx=db.transaction(IMGDB_STORE,"readwrite");tx.objectStore(IMGDB_STORE).delete(id);}catch(e){}
+}
+
+/* ----- スキャン状態のリセット ----- */
+function clearScanState(){
+  pendingPhotoId=null;
+  ["f_name","f_company","f_role","f_email","f_phone","f_task","f_memo"].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.classList.remove("autofilled");
+  });
+  const pv=document.getElementById("scanPreview");if(pv)pv.innerHTML="";
+}
+function setAuto(id,v){
+  if(v==null||v==="")return;
+  const el=document.getElementById(id);if(!el)return;
+  el.value=v;el.classList.add("autofilled");
+}
+
+/* ----- 抽出ロジック ----- */
+// 日本語OCRは文字間に空白を挟みがち（"株 式 会 社"）。CJK文字の間の空白を畳む。
+function deCjkSpace(s){
+  return (s||"").replace(/([一-鿿々ぁ-んァ-ヶ〆ヵヶ])[ \t]+(?=[一-鿿々ぁ-んァ-ヶ〆ヵヶ])/g,"$1")
+                .replace(/\s{2,}/g," ").trim();
+}
+function extractFields(raw){
+  const text=(raw||"").replace(/　/g," ");
+  const rawLines=text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
+  // 表示用＝CJK空白を畳んだ行。マッチ判定もこの正規化済み行で行う
+  const lines=rawLines.map(deCjkSpace);
+  const out={name:"",company:"",role:"",email:"",phone:"",extras:[]};
+
+  // メール
+  const mEmail=text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  if(mEmail)out.email=mEmail[0].replace(/[、。,]$/,"");
+
+  // 電話: TEL/電話 行を優先、固定優先→携帯
+  const phoneScan=(str)=>{const found=[];let r;const re=/(0\d{1,3}[-( ]?\d{1,4}[-) ]?\d{3,4})/g;while((r=re.exec(str)))found.push(r[1]);return found;};
+  const isMobile=p=>/^0[789]0/.test(p.replace(/[^\d]/g,""));
+  const allPhones=[];
+  const telLines=lines.filter(l=>/TEL|Tel|電話|ＴＥＬ/.test(l));
+  telLines.forEach(l=>phoneScan(l).forEach(p=>allPhones.push(p)));
+  if(!allPhones.length)phoneScan(text).forEach(p=>allPhones.push(p));
+  if(allPhones.length)out.phone=allPhones.find(p=>!isMobile(p))||allPhones[0];
+
+  // 会社名（日本語の社名表記を優先、無ければ英語表記）
+  const compJpRe=/株式会社|有限会社|合同会社|（株）|\(株\)/;
+  const compEnRe=/Inc\.?|Co\.,?\s?Ltd|LLC|Corporation|Corp\.?|Ltd\.?/i;
+  let compLine=lines.find(l=>compJpRe.test(l));
+  if(!compLine)compLine=lines.find(l=>compEnRe.test(l));
+  if(compLine)out.company=compLine;
+
+  // 役職/部署
+  const roleRe=/部長|課長|係長|主任|代表|取締役|社長|専務|常務|営業|部$|課$|マネージャー|マネージャ|Director|Manager|President|CEO|CTO|CFO|Officer/;
+  const roleLine=lines.find(l=>roleRe.test(l) && l!==compLine && !compJpRe.test(l) && !compEnRe.test(l));
+  if(roleLine)out.role=roleLine;
+
+  // 氏名: ①漢字姓名（2〜4＋空白＋2〜4）②役職行の近く ③連続漢字4-8 ④ローマ字 First Last へフォールバック
+  const nameJpRe=/^[一-鿿々]{1,4}[\s　]+[一-鿿々]{1,4}$/;
+  let nameLine=lines.find(l=>nameJpRe.test(l) && l!==compLine && l!==roleLine);
+  if(!nameLine && roleLine){
+    const ri=lines.indexOf(roleLine);
+    for(let i=ri+1;i<lines.length;i++){const l=lines[i];if(/^[一-鿿々]{2,8}$/.test(l.replace(/[\s　]/g,""))&&l!==compLine){nameLine=l;break;}}
+  }
+  if(!nameLine)nameLine=lines.find(l=>/^[一-鿿々]{4,8}$/.test(l.replace(/[\s　]/g,"")) && l!==compLine && l!==roleLine);
+  if(!nameLine){
+    // ローマ字氏名（例: "Taro Yamada"）。メール/会社/URLを除外
+    const romaji=lines.find(l=>/^[A-Z][a-z]+\s+[A-Z][a-z]+$/.test(l) && !compEnRe.test(l) && !/@|http/i.test(l));
+    if(romaji)nameLine=romaji;
+  }
+  if(nameLine)out.name=nameLine.trim();
+
+  // URL / 住所 → メモ補助
+  const mUrl=text.match(/https?:\/\/[^\s「」、。]+/i);
+  if(mUrl)out.extras.push(mUrl[0]);
+  const addrLine=lines.find(l=>/〒|\d{3}-?\d{4}/.test(l) && !compJpRe.test(l) && !compEnRe.test(l) && !/@/.test(l));
+  if(addrLine)out.extras.push(addrLine);
+
+  return out;
+}
+
+/* ----- OCR worker（オフライン考慮） ----- */
+async function getOcrWorker(onProg){
+  if(ocrWorker)return ocrWorker;
+  // Tesseract未ロード（CDN取得失敗＝オフライン等）
+  if(typeof Tesseract==="undefined")throw new Error("offline");
+  ocrWorker=await Tesseract.createWorker("jpn+eng",1,{
+    logger:m=>{
+      if(m.status==="recognizing text"&&onProg)onProg(Math.round(m.progress*100));
+    }
+  });
+  return ocrWorker;
+}
+
+async function runScan(file){
+  const btn=document.getElementById("btnScan");
+  const prog=document.getElementById("scanProg");
+  const progTxt=document.getElementById("scanProgTxt");
+  const preview=document.getElementById("scanPreview");
+
+  // プレビュー表示
+  const objUrl=URL.createObjectURL(file);
+  preview.innerHTML='<img alt="名刺プレビュー" src="'+objUrl+'">';
+
+  btn.disabled=true;
+  prog.classList.add("show");
+  progTxt.textContent="読み取り中… 0%";
+
+  try{
+    let worker;
+    try{
+      worker=await getOcrWorker(p=>{progTxt.textContent="読み取り中… "+p+"%";});
+    }catch(err){
+      // オフライン or CDN取得不可
+      prog.classList.remove("show");btn.disabled=false;
+      toast("⚠️ オフラインのため名刺OCRは使えません。手入力してください");
+      return;
+    }
+    progTxt.textContent="読み取り中… 0%";
+    const {data:{text}}=await worker.recognize(file);
+    const fields=extractFields(text);
+
+    // フォームへ自動セット（保存はしない）
+    setAuto("f_name",fields.name);
+    setAuto("f_company",fields.company);
+    setAuto("f_role",fields.role);
+    setAuto("f_email",fields.email);
+    setAuto("f_phone",fields.phone);
+    if(fields.extras.length){
+      const memoEl=document.getElementById("f_memo");
+      const add=fields.extras.join("\n");
+      memoEl.value=memoEl.value?(memoEl.value+"\n"+add):add;
+      memoEl.classList.add("autofilled");
+    }
+
+    // 画像をIndexedDBへ保存（保存待ちIDをフォームに紐付け）
+    try{
+      // 直前のpending画像があれば破棄
+      if(pendingPhotoId!=null)await imgDel(pendingPhotoId);
+      pendingPhotoId=await imgPut(file);
+    }catch(e){pendingPhotoId=null;}
+
+    prog.classList.remove("show");
+    btn.disabled=false;
+    const got=[fields.name&&"氏名",fields.company&&"会社",fields.email&&"メール",fields.phone&&"電話",fields.role&&"役職"].filter(Boolean);
+    toast("✨ 自動入力しました。内容を確認して保存してください"+(got.length?"（"+got.join("・")+"）":""));
+  }catch(e){
+    prog.classList.remove("show");
+    btn.disabled=false;
+    toast("⚠️ 読み取りに失敗しました。手入力してください");
+    console.log("OCR error",e);
+  }
+}
+
+document.getElementById("btnScan").addEventListener("click",()=>{
+  document.getElementById("fileCard").click();
+});
+document.getElementById("fileCard").addEventListener("change",e=>{
+  const f=e.target.files&&e.target.files[0];
+  if(f)runScan(f);
+  e.target.value="";
+});
+
+/* ----- 一覧サムネ拡大モーダル ----- */
+const _thumbUrls=[];
+function revokeThumbUrls(){_thumbUrls.splice(0).forEach(u=>{try{URL.revokeObjectURL(u);}catch(e){}});}
+async function hydrateThumbs(){
+  const slots=document.querySelectorAll("[data-thumb-photo]");
+  for(const slot of slots){
+    const pid=Number(slot.getAttribute("data-thumb-photo"));
+    try{
+      const blob=await imgGet(pid);
+      if(blob){
+        const url=URL.createObjectURL(blob);_thumbUrls.push(url);
+        slot.innerHTML='<img src="'+url+'" alt="名刺" data-full="'+url+'">';
+      }
+    }catch(e){}
+  }
+}
+document.getElementById("leadList").addEventListener("click",e=>{
+  const img=e.target.closest(".lead-thumb img");
+  if(!img)return;
+  const full=img.getAttribute("data-full");if(!full)return;
+  const m=document.getElementById("imgModal");
+  document.getElementById("imgModalImg").src=full;
+  m.classList.add("show");
+});
+document.getElementById("imgModal").addEventListener("click",()=>{
+  document.getElementById("imgModal").classList.remove("show");
+});
 
 /* ---------- render ---------- */
 function render(){renderDash();renderList();renderCounts();}
@@ -590,14 +874,17 @@ function renderList(){
     host.innerHTML=`<div class="empty"><div class="big">🗂️</div>${data.length?"該当するリードはありません":"まだリードがありません。<br>「クイック追加」から登録、または設定からサンプル/CSVを読み込めます。"}</div>`;
     return;
   }
+  revokeThumbUrls();
   host.innerHTML=rows.map(d=>{
     const G=GRADES[d.grade]||GRADES.D;
     const opts=Object.keys(STATUS).map(s=>`<option value="${s}" ${d.status===s?"selected":""}>${STATUS[s].label}</option>`).join("");
     const contact=[];
     if(d.email)contact.push(`<span>✉️ ${esc(d.email)}</span>`);
     if(d.phone)contact.push(`<span>📞 ${esc(d.phone)}</span>`);
+    const thumb=(d.photoId!=null)?`<div class="lead-thumb" data-thumb-photo="${d.photoId}"></div>`:"";
     return `<div class="lead" data-id="${d.id}">
-      <div class="lead-top">
+      <div class="lead-top${d.photoId!=null?" has-thumb":""}">
+        ${thumb}
         <div class="lead-id">
           <div class="name">${esc(d.name)||"（無名）"}</div>
           <div class="company">${esc(d.company)}</div>
@@ -618,6 +905,7 @@ function renderList(){
       </div>
     </div>`;
   }).join("");
+  hydrateThumbs();
 }
 
 function changeStatus(id,v){
@@ -627,6 +915,7 @@ function changeStatus(id,v){
 function deleteLead(id){
   const l=data.find(d=>d.id===id);if(!l)return;
   if(!confirm((l.name||"このリード")+" を削除しますか？"))return;
+  if(l.photoId!=null)imgDel(l.photoId);
   data=data.filter(d=>d.id!==id);save();render();toast("🗑️ 削除しました");
 }
 function editLead(id){
